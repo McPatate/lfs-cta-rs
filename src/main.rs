@@ -1,9 +1,15 @@
-use futures::stream::StreamExt;
+use futures::{stream::StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 use tokio::io;
-use tokio::io::AsyncWriteExt;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+
+#[derive(Debug, Error)]
+enum InternalError {
+    #[error("framed reader received None instead of line")]
+    FramedReaderError,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "event")]
@@ -66,11 +72,31 @@ struct Progress {
     bytes_since_last: u32,
 }
 
+impl Progress {
+    fn new(oid: &str, bytes_so_far: u32, bytes_since_last: u32) -> Self {
+        Self {
+            oid: oid.to_owned(),
+            bytes_so_far,
+            bytes_since_last,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Complete {
     oid: String,
     path: Option<String>,
     error: Option<ErrorInner>,
+}
+
+impl Complete {
+    fn new(oid: &str, path: Option<String>, error: Option<ErrorInner>) -> Self {
+        Self {
+            oid: oid.to_owned(),
+            path,
+            error,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -98,29 +124,66 @@ impl Error {
     }
 }
 
+async fn upload_file(request: Request) -> eyre::Result<()> {
+    let stdout = io::stdout();
+    let mut writer = FramedWrite::new(stdout, LinesCodec::new());
+
+    // init progress
+    writer
+        .send(serde_json::to_string(&Event::Progress(Progress::new(
+            &request.oid,
+            0,
+            0,
+        )))?)
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
     let mut reader = FramedRead::new(stdin, LinesCodec::new());
-    if let Some(init) = reader.next().await.transpose()? {
-        match serde_json::from_str::<Init>(&init) {
-            Ok(init) => println!("{:?}", init),
-            Err(err) => {
-                stdout
-                    .write_all(serde_json::to_string(&Error::new(32, err.to_string()))?.as_bytes())
+    let stdout = io::stdout();
+    let mut writer = FramedWrite::new(stdout, LinesCodec::new());
+
+    // handle init event
+    let init_line = reader
+        .next()
+        .await
+        .transpose()?
+        .ok_or_else(|| InternalError::FramedReaderError)?;
+    if let Err(err) = serde_json::from_str::<Init>(&init_line) {
+        writer
+            .send(serde_json::to_string(&Error::new(32, err.to_string()))?)
+            .await?;
+        return Ok(());
+    };
+    writer.send("{}").await?;
+
+    // main loop
+    while let Some(line) = reader.next().await {
+        let line = line?;
+        let event: Event = serde_json::from_str(&line)?;
+
+        match event {
+            Event::Download(DownloadRequest { request }) => {
+                writer
+                    .send(serde_json::to_string(&Event::Complete(Complete::new(
+                        &request.oid,
+                        None,
+                        Some(ErrorInner::new(
+                            2,
+                            "Agent does not support download".to_string(),
+                        )),
+                    )))?)
                     .await?;
             }
+            Event::Upload(UploadRequest { request }) => {
+                tokio::spawn(async { upload_file(request).await });
+            }
+            Event::Terminate => (),
+            _ => eprintln!("Unexpected event received in main loop : {}", line),
         }
-    }
-    stdout.write_all("{}".as_bytes()).await?;
-    while let Some(line) = reader.next().await {
-        let event: Event = serde_json::from_str(&line?)?;
-        match event {
-            _ => println!("received event : {:?}", event),
-        }
-        let terminate = Event::Terminate;
-        println!("{}", serde_json::to_string(&terminate)?);
     }
     Ok(())
 }
@@ -128,7 +191,7 @@ async fn main() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn test_parsing() {
+    async fn test_upload() {
         assert!(true);
     }
 }
