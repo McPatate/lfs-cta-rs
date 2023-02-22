@@ -15,6 +15,6 @@ As long as `git push` does not display an error, your file should be downloading
 ## TODO
 
 - [x] create mspc channel to write progress bytes sent in `upload_chunk`
-- [ ] test that `git push` works
-- [ ] test with 100mb chunks (update server side code as chunks & urls are determined by the hub)
+- [x] test that `git push` works
+- [x] test with 100mb chunks (update server side code as chunks & urls are determined by the hub)
 - [ ] add download
